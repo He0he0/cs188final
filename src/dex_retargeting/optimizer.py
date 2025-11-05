@@ -3,13 +3,42 @@ from typing import List, Optional
 
 import nlopt
 import numpy as np
-import torch
 
 from dex_retargeting.kinematics_adaptor import (
     KinematicAdaptor,
     MimicJointKinematicAdaptor,
 )
 from dex_retargeting.robot_wrapper import RobotWrapper
+
+
+def _smooth_l1_loss_with_grad(
+    diff: np.ndarray, beta: float, reduction: str = "mean"
+) -> tuple:
+    """Compute Smooth L1 (Huber) loss and its gradient with respect to diff."""
+    diff = np.asarray(diff, dtype=np.float32)
+    beta = float(beta)
+    if beta <= 0:
+        beta = 1e-12
+
+    abs_diff = np.abs(diff)
+    quadratic_mask = abs_diff < beta
+
+    loss = np.empty_like(diff, dtype=np.float32)
+    loss[quadratic_mask] = 0.5 * diff[quadratic_mask] ** 2 / beta
+    loss[~quadratic_mask] = abs_diff[~quadratic_mask] - 0.5 * beta
+
+    grad = np.empty_like(diff, dtype=np.float32)
+    grad[quadratic_mask] = diff[quadratic_mask] / beta
+    grad[~quadratic_mask] = np.sign(diff[~quadratic_mask])
+
+    if reduction == "mean":
+        loss_value = float(loss.mean())
+        grad /= diff.size
+        return loss_value, grad
+    if reduction == "none":
+        return loss, grad
+
+    raise ValueError(f"Unsupported reduction type: {reduction}")
 
 
 class Optimizer:
@@ -127,7 +156,7 @@ class PositionOptimizer(Optimizer):
     ):
         super().__init__(robot, target_joint_names, target_link_human_indices)
         self.body_names = target_link_names
-        self.huber_loss = torch.nn.SmoothL1Loss(beta=huber_delta)
+        self.huber_delta = float(huber_delta)
         self.norm_delta = norm_delta
 
         # Sanity check and cache link indices
@@ -140,8 +169,7 @@ class PositionOptimizer(Optimizer):
     ):
         qpos = np.zeros(self.num_joints)
         qpos[self.idx_pin2fixed] = fixed_qpos
-        torch_target_pos = torch.as_tensor(target_pos)
-        torch_target_pos.requires_grad_(False)
+        target_pos = np.asarray(target_pos, dtype=np.float32)
 
         def objective(x: np.ndarray, grad: np.ndarray) -> float:
             qpos[self.idx_pin2target] = x
@@ -158,13 +186,10 @@ class PositionOptimizer(Optimizer):
                 [pose[:3, 3] for pose in target_link_poses], axis=0
             )  # (n ,3)
 
-            # Torch computation for accurate loss and grad
-            torch_body_pos = torch.as_tensor(body_pos)
-            torch_body_pos.requires_grad_()
-
-            # Loss term for kinematics retargeting based on 3D position error
-            huber_distance = self.huber_loss(torch_body_pos, torch_target_pos)
-            result = huber_distance.cpu().detach().item()
+            diff = body_pos - target_pos
+            result, grad_body = _smooth_l1_loss_with_grad(
+                diff, self.huber_delta, reduction="mean"
+            )
 
             if grad.size > 0:
                 jacobians = []
@@ -179,8 +204,7 @@ class PositionOptimizer(Optimizer):
 
                 # Note: the joint order in this jacobian is consistent pinocchio
                 jacobians = np.stack(jacobians, axis=0)
-                huber_distance.backward()
-                grad_pos = torch_body_pos.grad.cpu().numpy()[:, None, :]
+                grad_pos = grad_body.astype(np.float32)[:, None, :]
 
                 # Convert the jacobian from pinocchio order to target order
                 if self.adaptor is not None:
@@ -217,7 +241,7 @@ class VectorOptimizer(Optimizer):
         super().__init__(robot, target_joint_names, target_link_human_indices)
         self.origin_link_names = target_origin_link_names
         self.task_link_names = target_task_link_names
-        self.huber_loss = torch.nn.SmoothL1Loss(beta=huber_delta, reduction="mean")
+        self.huber_delta = float(huber_delta)
         self.norm_delta = norm_delta
         self.scaling = scaling
 
@@ -226,11 +250,13 @@ class VectorOptimizer(Optimizer):
         self.computed_link_names = list(
             set(target_origin_link_names).union(set(target_task_link_names))
         )
-        self.origin_link_indices = torch.tensor(
-            [self.computed_link_names.index(name) for name in target_origin_link_names]
+        self.origin_link_indices = np.array(
+            [self.computed_link_names.index(name) for name in target_origin_link_names],
+            dtype=int,
         )
-        self.task_link_indices = torch.tensor(
-            [self.computed_link_names.index(name) for name in target_task_link_names]
+        self.task_link_indices = np.array(
+            [self.computed_link_names.index(name) for name in target_task_link_names],
+            dtype=int,
         )
 
         # Cache link indices that will involve in kinematics computation
@@ -243,8 +269,7 @@ class VectorOptimizer(Optimizer):
     ):
         qpos = np.zeros(self.num_joints)
         qpos[self.idx_pin2fixed] = fixed_qpos
-        torch_target_vec = torch.as_tensor(target_vector) * self.scaling
-        torch_target_vec.requires_grad_(False)
+        target_vec = np.asarray(target_vector, dtype=np.float32) * self.scaling
 
         def objective(x: np.ndarray, grad: np.ndarray) -> float:
             qpos[self.idx_pin2target] = x
@@ -259,19 +284,18 @@ class VectorOptimizer(Optimizer):
             ]
             body_pos = np.array([pose[:3, 3] for pose in target_link_poses])
 
-            # Torch computation for accurate loss and grad
-            torch_body_pos = torch.as_tensor(body_pos)
-            torch_body_pos.requires_grad_()
-
             # Index link for computation
-            origin_link_pos = torch_body_pos[self.origin_link_indices, :]
-            task_link_pos = torch_body_pos[self.task_link_indices, :]
+            origin_link_pos = body_pos[self.origin_link_indices, :]
+            task_link_pos = body_pos[self.task_link_indices, :]
             robot_vec = task_link_pos - origin_link_pos
 
-            # Loss term for kinematics retargeting based on 3D position error
-            vec_dist = torch.norm(robot_vec - torch_target_vec, dim=1, keepdim=False)
-            huber_distance = self.huber_loss(vec_dist, torch.zeros_like(vec_dist))
-            result = huber_distance.cpu().detach().item()
+            diff_vec = robot_vec - target_vec
+            vec_dist = np.linalg.norm(diff_vec, axis=1)
+            # Smooth L1 on the scalar distances
+            zero_target = np.zeros_like(vec_dist, dtype=np.float32)
+            result, grad_vec = _smooth_l1_loss_with_grad(
+                vec_dist - zero_target, self.huber_delta, reduction="mean"
+            )
 
             if grad.size > 0:
                 jacobians = []
@@ -286,8 +310,16 @@ class VectorOptimizer(Optimizer):
 
                 # Note: the joint order in this jacobian is consistent pinocchio
                 jacobians = np.stack(jacobians, axis=0)
-                huber_distance.backward()
-                grad_pos = torch_body_pos.grad.cpu().numpy()[:, None, :]
+                safe_dist = np.maximum(vec_dist, 1e-12)
+                grad_robot_vec = grad_vec[:, None] * diff_vec / safe_dist[:, None]
+                grad_robot_vec[vec_dist == 0] = 0.0
+
+                grad_body_pos = np.zeros_like(body_pos, dtype=np.float32)
+                for i in range(robot_vec.shape[0]):
+                    grad_body_pos[self.task_link_indices[i]] += grad_robot_vec[i]
+                    grad_body_pos[self.origin_link_indices[i]] -= grad_robot_vec[i]
+
+                grad_pos = grad_body_pos[:, None, :]
 
                 # Convert the jacobian from pinocchio order to target order
                 if self.adaptor is not None:
@@ -370,7 +402,7 @@ class DexPilotOptimizer(Optimizer):
         self.origin_link_names = target_origin_link_names
         self.task_link_names = target_task_link_names
         self.scaling = scaling
-        self.huber_loss = torch.nn.SmoothL1Loss(beta=huber_delta, reduction="none")
+        self.huber_delta = float(huber_delta)
         self.norm_delta = norm_delta
 
         # DexPilot parameters
@@ -384,11 +416,13 @@ class DexPilotOptimizer(Optimizer):
         self.computed_link_names = list(
             set(target_origin_link_names).union(set(target_task_link_names))
         )
-        self.origin_link_indices = torch.tensor(
-            [self.computed_link_names.index(name) for name in target_origin_link_names]
+        self.origin_link_indices = np.array(
+            [self.computed_link_names.index(name) for name in target_origin_link_names],
+            dtype=int,
         )
-        self.task_link_indices = torch.tensor(
-            [self.computed_link_names.index(name) for name in target_task_link_names]
+        self.task_link_indices = np.array(
+            [self.computed_link_names.index(name) for name in target_task_link_names],
+            dtype=int,
         )
 
         # Sanity check and cache link indices
@@ -458,6 +492,7 @@ class DexPilotOptimizer(Optimizer):
     ):
         qpos = np.zeros(self.num_joints)
         qpos[self.idx_pin2fixed] = fixed_qpos
+        target_vector = np.asarray(target_vector, dtype=np.float32)
 
         len_proj = len(self.projected)
         len_s2 = len(self.s2_project_index_task)
@@ -482,15 +517,12 @@ class DexPilotOptimizer(Optimizer):
 
         # We change the weight to 10 instead of 1 here, for vector originate from wrist to fingertips
         # This ensures better intuitive mapping due wrong pose detection
-        weight = torch.from_numpy(
-            np.concatenate(
-                [
-                    weight,
-                    np.ones(self.num_fingers, dtype=np.float32) * len_proj
-                    + self.num_fingers,
-                ]
-            )
-        )
+        weight = np.concatenate(
+            [
+                weight,
+                np.ones(self.num_fingers, dtype=np.float32) * len_proj + self.num_fingers,
+            ]
+        ).astype(np.float32)
 
         # Compute reference distance vector
         normal_vec = target_vector * self.scaling  # (10, 3)
@@ -503,9 +535,7 @@ class DexPilotOptimizer(Optimizer):
         )  # (6, 3)
         reference_vec = np.concatenate(
             [reference_vec, normal_vec[len_proj:]], axis=0
-        )  # (10, 3)
-        torch_target_vec = torch.as_tensor(reference_vec, dtype=torch.float32)
-        torch_target_vec.requires_grad_(False)
+        ).astype(np.float32)  # (10, 3)
 
         def objective(x: np.ndarray, grad: np.ndarray) -> float:
             qpos[self.idx_pin2target] = x
@@ -520,25 +550,21 @@ class DexPilotOptimizer(Optimizer):
             ]
             body_pos = np.array([pose[:3, 3] for pose in target_link_poses])
 
-            # Torch computation for accurate loss and grad
-            torch_body_pos = torch.as_tensor(body_pos)
-            torch_body_pos.requires_grad_()
-
             # Index link for computation
-            origin_link_pos = torch_body_pos[self.origin_link_indices, :]
-            task_link_pos = torch_body_pos[self.task_link_indices, :]
+            origin_link_pos = body_pos[self.origin_link_indices, :]
+            task_link_pos = body_pos[self.task_link_indices, :]
             robot_vec = task_link_pos - origin_link_pos
 
             # Loss term for kinematics retargeting based on 3D position error
             # Different from the original DexPilot, we use huber loss here instead of the squared dist
-            vec_dist = torch.norm(robot_vec - torch_target_vec, dim=1, keepdim=False)
-            huber_distance = (
-                self.huber_loss(vec_dist, torch.zeros_like(vec_dist))
-                * weight
-                / (robot_vec.shape[0])
-            ).sum()
-            huber_distance = huber_distance.sum()
-            result = huber_distance.cpu().detach().item()
+            diff_vec = robot_vec - reference_vec
+            vec_dist = np.linalg.norm(diff_vec, axis=1)
+
+            huber_val, grad_vec = _smooth_l1_loss_with_grad(
+                vec_dist, self.huber_delta, reduction="none"
+            )
+            weighted_loss = (huber_val * weight) / robot_vec.shape[0]
+            result = float(np.sum(weighted_loss))
 
             if grad.size > 0:
                 jacobians = []
@@ -553,8 +579,17 @@ class DexPilotOptimizer(Optimizer):
 
                 # Note: the joint order in this jacobian is consistent pinocchio
                 jacobians = np.stack(jacobians, axis=0)
-                huber_distance.backward()
-                grad_pos = torch_body_pos.grad.cpu().numpy()[:, None, :]
+                d_loss_d_vecdist = grad_vec * weight / robot_vec.shape[0]
+                safe_dist = np.maximum(vec_dist, 1e-12)
+                grad_robot_vec = d_loss_d_vecdist[:, None] * diff_vec / safe_dist[:, None]
+                grad_robot_vec[vec_dist == 0] = 0.0
+
+                grad_body_pos = np.zeros_like(body_pos, dtype=np.float32)
+                for i in range(robot_vec.shape[0]):
+                    grad_body_pos[self.task_link_indices[i]] += grad_robot_vec[i]
+                    grad_body_pos[self.origin_link_indices[i]] -= grad_robot_vec[i]
+
+                grad_pos = grad_body_pos[:, None, :]
 
                 # Convert the jacobian from pinocchio order to target order
                 if self.adaptor is not None:
