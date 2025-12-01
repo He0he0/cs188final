@@ -39,6 +39,16 @@ def _wrist_rot_to_matrix(wrist_rot: Optional[np.ndarray]) -> Optional[np.ndarray
         return rotations.matrix_from_quaternion(wrist_rot)
     return None
 
+# View correction for mapping camera(hand) frame → robot frame.
+# This is the tilt that you experimentally found to look good:
+# axis = [1, 0, 1], angle = -90 deg
+R_tilt = rotations.matrix_from_axis_angle(
+    np.array([1.0, 0.0, 1.0, -np.pi / 2.0])
+)
+
+# Final view rotation (you can later add more corrections if needed)
+WRIST_VIEW_ROT = R_tilt
+
 
 def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path: str):
     RetargetingConfig.set_default_urdf_dir(str(robot_dir))
@@ -151,24 +161,33 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
             logger.error("Failed to fetch camera frame for 5 seconds.")
             return
 
-        # SingleHandDetector returns: (num_hands, joint_pos, keypoint_2d, wrist_rot_raw)
+        # Run hand detector
         num_hands, joint_pos, keypoint_2d, wrist_rot_raw = detector.detect(rgb)
         wrist_R = _wrist_rot_to_matrix(wrist_rot_raw)
 
-        bgr = detector.draw_skeleton_on_image(bgr, keypoint_2d, style="default")
-        cv2.imshow("realtime_retargeting_demo", bgr)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-        # [WRIST PATCH] Calibrate wrist orientation using the first valid frame
+        # Auto calibration: first time we get a valid wrist_R
         if wrist_R is not None and calib_wrist_R[0] is None:
             calib_wrist_R[0] = wrist_R.copy()
-            logger.info("Wrist orientation calibrated.")
+            logger.info("Wrist orientation calibrated (auto).")
+
+        # Draw skeleton for visualization
+        bgr = detector.draw_skeleton_on_image(bgr, keypoint_2d, style="default")
+        cv2.imshow("realtime_retargeting_demo", bgr)
+
+        # Keyboard controls
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        elif key == ord("c"):
+            # Manual calibration when user presses 'c'
+            if wrist_R is not None:
+                calib_wrist_R[0] = wrist_R.copy()
+                logger.info("Wrist orientation calibrated (manual 'c').")
 
         if joint_pos is None:
-            logger.warning(f"{hand_type} hand not detected.")
+            logger.warning(f"{hand_type_str} hand not detected.")
         else:
-            # Build retargeting input (vector or position)
+            # Build retargeting reference (position or vector)
             retargeting_type = retargeting.optimizer.retargeting_type
             indices = retargeting.optimizer.target_link_human_indices
 
@@ -179,30 +198,27 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
                 task_indices = indices[1, :]
                 ref_value = joint_pos[task_indices, :] - joint_pos[origin_indices, :]
 
-            # Finger retargeting (same as original)
+            # Finger retargeting
             qpos = retargeting.retarget(ref_value)
             robot.set_qpos(qpos[retargeting_to_sapien])
 
-            # [WRIST PATCH] Apply wrist orientation to robot base rotation
+            # Wrist orientation retargeting
             if wrist_R is not None and calib_wrist_R[0] is not None:
-                # Relative hand wrist rotation: R_rel = R_current * R_calib^T
+                # Relative wrist rotation wrt calibrated pose
                 R_rel = wrist_R @ calib_wrist_R[0].T
 
-                # Retrieve initial robot rotation
                 base_T = base_robot_pose.to_transformation_matrix()
                 R_robot0 = base_T[:3, :3]
 
-                # New robot rotation = relative wrist rotation * initial robot rotation
-                R_robot = R_rel @ R_robot0
-
-                # Convert to quaternion
+                # Apply view correction and base rotation
+                R_robot = WRIST_VIEW_ROT @ R_rel @ R_robot0
                 q_robot = rotations.quaternion_from_matrix(R_robot)
 
-                # Update robot base pose: position stays, rotation changes
-                new_pose = sapien.Pose(base_robot_pose.p, q_robot)
+                # Keep position fixed, only update rotation
+                new_pose = sapien.Pose(base_pos, q_robot)
                 robot.set_pose(new_pose)
 
-        # Render multiple times for smoother display
+        # Render a few times for smoother display
         for _ in range(2):
             viewer.render()
 
