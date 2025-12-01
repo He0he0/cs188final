@@ -185,7 +185,7 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
                 logger.info("Wrist orientation calibrated (manual 'c').")
 
         if joint_pos is None:
-            logger.warning(f"{hand_type_str} hand not detected.")
+            logger.warning(f"{hand_type} hand not detected.")
         else:
             # Build retargeting reference (position or vector)
             retargeting_type = retargeting.optimizer.retargeting_type
