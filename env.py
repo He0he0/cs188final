@@ -59,6 +59,9 @@ hand_open = 0
 min_dist = 0.02
 max_dist = 0.15
 
+open_hand =  np.array([-1.4, -1.4, -1.4, -1.4, -2.9, 2.9])
+close_hand =  np.array([1.4, 1.4, 1.4, 1.4, 2.9, 2.9])
+
 # ----------------------------
 # Background thread: webcam + hand detection only (doesn't handle actions)
 # ----------------------------
@@ -168,7 +171,7 @@ try:
             action[:3] = control
 
             # map to gripper action (assuming 0=closed, 1=open)
-            action[6:] = hand_open
+            action[6:] =open_hand +  hand_open * (close_hand-open_hand)
         obs, reward, done, info = env.step(action)
         env.render()  # OpenGL render stays on main thread
 
