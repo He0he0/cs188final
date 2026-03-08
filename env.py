@@ -4,7 +4,7 @@ import threading
 import queue
 import robosuite as suite
 from dex_retargeting.constants import HandType
-from example.vector_retargeting.single_hand_detector import SingleHandDetector
+import mediapipe as mp
 
 class PDController:
     def __init__(self, kp, kd, target=None):
@@ -53,8 +53,7 @@ pd = PDController(kp=5.0, kd=0.5, target=np.zeros(3))
 data_lock = threading.Lock()
 stop_event = threading.Event()
 
-hand_start = None
-robot_start = None
+
 latest_hand_pos = None
 hand_open = 0
 min_dist = 0.02
@@ -66,54 +65,62 @@ max_dist = 0.15
 def webcam_thread_fn():
     global latest_hand_pos, hand_open
 
-    hand_type = HandType.right
-    detector = SingleHandDetector(
-        hand_type="Right" if hand_type == HandType.right else "Left",
-        selfie=True,
+    mp_hands = mp.solutions.hands
+    mp_drawing = mp.solutions.drawing_utils
+    mp_drawing_styles = mp.solutions.drawing_styles
+
+    hands = mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=1,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
     )
 
     cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("ERROR: Could not open webcam. Try index 1 or 2.")
-        stop_event.set()
-        return
 
-    scale = 0.5
     while cap.isOpened() and not stop_event.is_set():
         ret, frame = cap.read()
         if not ret:
             continue
 
         frame = cv2.flip(frame, 1)
-        rgb = frame[..., ::-1]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        _, joint_pos, keypoint_2d, wrist_rot, wrist_pos = detector.detect(rgb)
-        if keypoint_2d is not None:
-            frame = detector.draw_skeleton_on_image(frame, keypoint_2d, style="default")
+        result = hands.process(rgb)
 
-        if joint_pos is not None and wrist_pos is not None:
-            wrist = np.array([float(wrist_pos[0]), float(wrist_pos[1]), float(wrist_pos[2])])
-            cv2.putText(frame, f"Wrist: {wrist_pos.round(2)}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            
-            thumb_tip = joint_pos[4]
-            pinky_tip = joint_pos[20]
-            # print(joint_pos)
-            # distance between thumb and pinky → 0 (closed) to 1 (open)
-            hand_dist_unnorm = np.linalg.norm(thumb_tip - pinky_tip)
-            hand_dist = np.clip(hand_dist_unnorm, min_dist, max_dist)
+        if result.multi_hand_landmarks:
+            for hand_landmarks in result.multi_hand_landmarks:
 
-            hand_open = (hand_dist - min_dist) / (max_dist - min_dist)
+                wrist = hand_landmarks.landmark[0]
+                index_mcp = hand_landmarks.landmark[5]
+                pinky_mcp = hand_landmarks.landmark[17]
+                thumb_tip = hand_landmarks.landmark[4]
+                pinky_tip = hand_landmarks.landmark[20]
 
-            hand_open = 1-np.clip(hand_open * 1.0, 0, 1)
-            print(hand_open)
-            with data_lock:
-                latest_hand_pos = wrist
-        else:
-                cv2.putText(frame, "No hand detected", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                x = wrist.x
+                y = wrist.y
+                print(x, y)
 
-        
+                depth = np.sqrt(
+                    (index_mcp.x - pinky_mcp.x)**2 +
+                    (index_mcp.y - pinky_mcp.y)**2
+                )
+                print(depth)
+
+                hand_vec = np.array([x, y, depth])
+
+                pinch_dist = np.sqrt(
+                    (thumb_tip.x - pinky_tip.x)**2 +
+                    (thumb_tip.y - pinky_tip.y)**2
+                )
+
+                hand_open = 1-np.clip(pinch_dist * 4, 0, 1)
+
+                with data_lock:
+                    latest_hand_pos = hand_vec
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            stop_event.set()
 
     cap.release()
     cv2.destroyAllWindows()
@@ -140,27 +147,22 @@ cam_thread.start()
 
 print("Live teleoperation started. Press Ctrl+C to quit.\n")
 # print(env.robots[0].gripper['right'].joints)
-scale = 4.0
 try:
     while not stop_event.is_set():
         with data_lock:
             hand_pos = None if latest_hand_pos is None else latest_hand_pos.copy()
         robot_pos = obs["robot0_eef_pos"]
-        if hand_pos is not None and hand_start is None:
-            hand_start = hand_pos.copy()
-            robot_start = robot_pos.copy()
         action = np.zeros(12)
 
-        if hand_pos is not None and hand_start is not None:
-            hand_delta = hand_pos - hand_start
-            hand_delta_robot = np.array([
-                hand_delta[2],
-                -hand_delta[0],
-                hand_delta[1]
-            ])
-            robot_target = robot_start + scale * hand_delta_robot
+        if hand_pos is not None:
+            print(robot_pos)
 
-            pd.target = robot_target
+            # x range is about -0.5 to 0.5
+            # y range is about 0.9 to 1.4
+            # z stable range is about 0.05 (back) to 0.25 (front) on camera, -0.2 to 0.2 for robot
+
+            pd.target = [(hand_pos[2]-0.05)*2 -0.2, hand_pos[0]-0.5, (1-hand_pos[1])/2 + 0.9]
+            # pd.target = [robot_pos[0]-0.1, robot_pos[1], robot_pos[2]]
             control = pd.update(robot_pos)
 
             action[:3] = control

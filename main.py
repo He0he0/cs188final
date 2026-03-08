@@ -30,6 +30,9 @@ while True:
 
     if result.multi_hand_landmarks:
         for hand_landmarks in result.multi_hand_landmarks:
+            wrist = hand_landmarks.landmark[0]
+
+            print(f"Wrist: x={wrist.x:.4f}, y={wrist.y:.4f}, z={wrist.z:.4f}")
             mp_drawing.draw_landmarks(
                 frame,
                 hand_landmarks,
