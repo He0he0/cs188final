@@ -56,6 +56,11 @@ stop_event = threading.Event()
 
 latest_hand_pos = None
 hand_open = 0
+index_open =0
+middle_open = 0
+ring_open = 0
+pinky_open = 0
+thumb_open = 0
 min_dist = 0.02
 max_dist = 0.15
 
@@ -66,9 +71,9 @@ close_hand =  np.array([1.4, 1.4, 1.4, 1.4, 2.9, 2.9])
 # Background thread: webcam + hand detection only (doesn't handle actions)
 # ----------------------------
 def webcam_thread_fn():
-    global latest_hand_pos, hand_open
+    global latest_hand_pos, hand_open, index_open, middle_open, ring_open, pinky_open, thumb_open
 
-    mp_hands = mp.solutions.hands
+    mp_hands = mp.solutions.hands   
     mp_drawing = mp.solutions.drawing_utils
     mp_drawing_styles = mp.solutions.drawing_styles
 
@@ -99,6 +104,9 @@ def webcam_thread_fn():
                 pinky_mcp = hand_landmarks.landmark[17]
                 thumb_tip = hand_landmarks.landmark[4]
                 pinky_tip = hand_landmarks.landmark[20]
+                index_tip =  hand_landmarks.landmark[8]
+                middle_tip = hand_landmarks.landmark[12]
+                ring_tip = hand_landmarks.landmark[16]
 
                 x = wrist.x
                 y = wrist.y
@@ -108,16 +116,42 @@ def webcam_thread_fn():
                     (index_mcp.x - pinky_mcp.x)**2 +
                     (index_mcp.y - pinky_mcp.y)**2
                 )
-                print(depth)
-
-                hand_vec = np.array([x, y, depth])
 
                 pinch_dist = np.sqrt(
                     (thumb_tip.x - pinky_tip.x)**2 +
                     (thumb_tip.y - pinky_tip.y)**2
                 )
 
+                hand_vec = np.array([x, y, depth])
+
+                index_to_palm = np.sqrt(
+                    (index_tip.x - x)**2 +
+                    (index_tip.y - y)**2
+                )
+                middle_to_palm = np.sqrt(
+                    (middle_tip.x - x)**2 +
+                    (middle_tip.y - y)**2
+                )
+                ring_to_palm = np.sqrt(
+                    (ring_tip.x - x)**2 +
+                    (ring_tip.y - y)**2
+                )
+                pinky_to_palm = np.sqrt(
+                (pinky_tip.x - x)**2 +
+                (pinky_tip.y - y)**2
+            )
+                thum_to_palm = np.sqrt(
+                (thumb_tip.x - pinky_mcp.x)**2 +
+                (thumb_tip.y - pinky_mcp.y)**2
+            )
+                
+
+                index_open =  1-np.clip(index_to_palm * 4, 0, 1)
+                middle_open = 1-np.clip(middle_to_palm * 4, 0, 1)
+                ring_open = 1-np.clip(ring_to_palm * 4, 0, 1)
                 hand_open = 1-np.clip(pinch_dist * 4, 0, 1)
+                pinky_open = 1 - np.clip(pinky_to_palm * 4, 0, 1)
+                thumb_open = 1 - np.clip(thum_to_palm * 4, 0, 1)
 
                 with data_lock:
                     latest_hand_pos = hand_vec
@@ -133,7 +167,7 @@ def webcam_thread_fn():
 # Main thread: MuJoCo env + render (OpenGL MUST stay on main thread)
 # ----------------------------
 env = suite.make(
-    env_name="NutAssembly",
+    env_name="Lift",
     robots="Panda",
     gripper_types="InspireRightHand",
     has_renderer=True,
@@ -154,6 +188,11 @@ try:
     while not stop_event.is_set():
         with data_lock:
             hand_pos = None if latest_hand_pos is None else latest_hand_pos.copy()
+            _thumb_open = thumb_open ** 0.7
+            _index_open  = index_open** 0.7
+            _middle_open = middle_open** 0.7
+            _ring_open   = ring_open** 0.7
+            _pinky_open  = pinky_open** 0.7
         robot_pos = obs["robot0_eef_pos"]
         action = np.zeros(12)
 
@@ -171,7 +210,14 @@ try:
             action[:3] = control
 
             # map to gripper action (assuming 0=closed, 1=open)
-            action[6:] =open_hand +  hand_open * (close_hand-open_hand)
+            action[6] = open_hand[0] + _pinky_open  * (close_hand[0] - open_hand[0])
+            action[7] = open_hand[1] + _ring_open   * (close_hand[1] - open_hand[1])
+            action[8] = open_hand[2] + _middle_open * (close_hand[2] - open_hand[2])
+            action[9] = open_hand[3] + _index_open  * (close_hand[3] - open_hand[3])
+            action[10] = open_hand[4] + _thumb_open   * (close_hand[4] - open_hand[4])
+            # action[11] = open_hand[5] + _hand_open   * (close_hand[5] - open_hand[5]) * 1.3     
+            #action[6:] = open_hand + pinch_dist + (close_hand - open_hand)  <-- disable other action and uncomment this for basic grip      
+            
         obs, reward, done, info = env.step(action)
         env.render()  # OpenGL render stays on main thread
 
