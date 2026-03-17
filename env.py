@@ -1,11 +1,11 @@
 import cv2
 import numpy as np
 import threading
-import queue
 import robosuite as suite
 from dex_retargeting.constants import HandType
 import mediapipe as mp
 from scipy.spatial.transform import Rotation as R
+import argparse
 
 
 import numpy as np
@@ -84,6 +84,7 @@ latest_hand_pos = None
 latest_wrist_frame = None
 initial_hand_rot = None
 initial_robot_rot = None
+USE_INDIVIDUAL_FINGERS = False
 hand_open = 0
 index_open =0
 middle_open = 0
@@ -96,9 +97,9 @@ max_dist = 0.15
 open_hand =  np.array([-1.4, -1.4, -1.4, -1.4, -2.9, 2.9])
 close_hand =  np.array([1.4, 1.4, 1.4, 1.4, 2.9, 2.9])
 MP_TO_ROBOT = np.array([
-    [ 0,  0,  1],   # robot x ← mediapipe z
-    [-1,  0,  0],   # robot y ← -mediapipe x
-    [ 0, -1,  0],   # robot z ← -mediapipe y
+    [ 0,  0,  1],  
+    [-1,  0,  0],  
+    [ 0, -1,  0],  
 ])
 
 # ----------------------------
@@ -108,8 +109,6 @@ def webcam_thread_fn():
     global latest_hand_pos, hand_open, index_open, middle_open, ring_open, pinky_open, thumb_open, pinch_dist, latest_wrist_frame
 
     mp_hands = mp.solutions.hands   
-    mp_drawing = mp.solutions.drawing_utils
-    mp_drawing_styles = mp.solutions.drawing_styles
 
     hands = mp_hands.Hands(
         static_image_mode=False,
@@ -132,7 +131,7 @@ def webcam_thread_fn():
 
         if result.multi_hand_landmarks:
             for hand_landmarks in result.multi_hand_landmarks:
-
+                #hand landmarks from mediapipe
                 wrist = hand_landmarks.landmark[0]
                 index_mcp = hand_landmarks.landmark[5]
                 pinky_mcp = hand_landmarks.landmark[17]
@@ -150,7 +149,7 @@ def webcam_thread_fn():
 
                 x = wrist.x
                 y = wrist.y
-
+                
                 depth = np.sqrt(
                     (index_mcp.x - pinky_mcp.x)**2 +
                     (index_mcp.y - pinky_mcp.y)**2
@@ -205,11 +204,20 @@ def webcam_thread_fn():
     cv2.destroyAllWindows()
 
 
-# ----------------------------
-# Main thread: MuJoCo env + render (OpenGL MUST stay on main thread)
-# ----------------------------
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--finger_mode",
+    action="store_true",
+    help="Use individual finger retargeting instead of unified grip"
+)
+args = parser.parse_args()
+
+USE_INDIVIDUAL_FINGERS = args.finger_mode
+print("Finger mode:", "Individual" if USE_INDIVIDUAL_FINGERS else "Unified")
+
+#robosuite environment
 env = suite.make(
-    env_name="Door",
+    env_name="Lift",
     robots="Panda",
     gripper_types="InspireRightHand",
     has_renderer=True,
@@ -225,7 +233,6 @@ cam_thread = threading.Thread(target=webcam_thread_fn, daemon=True)
 cam_thread.start()
 
 print("Live teleoperation started. Press Ctrl+C to quit.\n")
-# print(env.robots[0].gripper['right'].joints)
 try:
     while not stop_event.is_set():
         with data_lock:
@@ -252,14 +259,17 @@ try:
             action[:3] = control
 
             # map to gripper action (assuming 0=closed, 1=open)
-            # action[6] = open_hand[0] + _pinky_open  * (close_hand[0] - open_hand[0])
-            # action[7] = open_hand[1] + _ring_open   * (close_hand[1] - open_hand[1])
-            # action[8] = open_hand[2] + _middle_open * (close_hand[2] - open_hand[2])
-            # action[9] = open_hand[3] + _index_open  * (close_hand[3] - open_hand[3])
-            # action[10] = open_hand[4] + _thumb_open   * (close_hand[4] - open_hand[4])
-            # action[11] = open_hand[5] + _hand_open   * (close_hand[5] - open_hand[5]) * 1.3     
-            action[6:] = open_hand + hand_open * (close_hand - open_hand)  
+            if USE_INDIVIDUAL_FINGERS: 
+                action[6] = open_hand[0] + _pinky_open  * (close_hand[0] - open_hand[0])
+                action[7] = open_hand[1] + _ring_open   * (close_hand[1] - open_hand[1])
+                action[8] = open_hand[2] + _middle_open * (close_hand[2] - open_hand[2])
+                action[9] = open_hand[3] + _index_open  * (close_hand[3] - open_hand[3])
+                action[10] = open_hand[4] + _thumb_open   * (close_hand[4] - open_hand[4])
+            else:   
+                #map to all fingers at once 
+                action[6:] = open_hand + hand_open * (close_hand - open_hand)  
             if wrist_frame is not None:
+                #wrist orientation
                 robot_world_mat = MP_TO_ROBOT @ wrist_frame
                 hand_rot_world = R.from_matrix(robot_world_mat)
                 current_rot = R.from_quat(obs['robot0_eef_quat'])
@@ -274,7 +284,8 @@ try:
 
                 rot_error = target_robot_rot * current_rot.inv()
                 rotvec = rot_error.as_rotvec()
-
+                
+                #map to robot orientation 
                 action[3:6] = 0.8 * rotvec
       
             
