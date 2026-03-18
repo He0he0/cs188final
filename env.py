@@ -217,7 +217,7 @@ print("Finger mode:", "Individual" if USE_INDIVIDUAL_FINGERS else "Unified")
 
 #robosuite environment
 env = suite.make(
-    env_name="Lift",
+    env_name="PickPlace",
     robots="Panda",
     gripper_types="InspireRightHand",
     has_renderer=True,
@@ -234,6 +234,8 @@ cam_thread.start()
 
 print("Live teleoperation started. Press Ctrl+C to quit.\n")
 try:
+    detected_hands = 0
+    locked_state = None
     while not stop_event.is_set():
         with data_lock:
             hand_pos = None if latest_hand_pos is None else latest_hand_pos.copy()
@@ -245,14 +247,63 @@ try:
             _pinky_open  = pinky_open** 0.7
         robot_pos = obs["robot0_eef_pos"]
         action = np.zeros(12)
-
         if hand_pos is not None:
+            detected_hands+=1
+        if hand_pos is not None and detected_hands>50:
 
             # x range is about -0.5 to 0.5
             # y range is about 0.9 to 1.4
             # z stable range is about 0.05 (back) to 0.25 (front) on camera, -0.2 to 0.2 for robot
 
-            pd.target = [(hand_pos[2]-0.05)*2 -0.2, hand_pos[0]-0.5, (1-hand_pos[1])/2 + 0.9]
+            milk_pos = obs['Milk_pos']
+            milk_pos[2] += 0.3
+
+            cereal_pos = obs["Cereal_pos"]
+            cereal_pos[2] += 0.3
+
+            bread_pos = obs["Bread_pos"]
+            bread_pos[2] += 0.3
+
+            can_pos = obs["Can_pos"]
+            can_pos[2] += 0.3
+
+            if locked_state=="Milk":
+                pd.target = milk_pos
+            
+            elif locked_state=="Cereal":
+                pd.target = cereal_pos
+            
+            elif locked_state=="Bread":
+                pd.target = bread_pos
+
+            elif locked_state=="Can":
+                pd.target = can_pos
+
+            else:
+                pd.target = [(hand_pos[2]-0.05)*3 -0.3, (hand_pos[0]-0.2)/0.6-0.5, (1-hand_pos[1])/2 + 0.9]
+
+            milk_distance = np.linalg.norm(pd.target-milk_pos)
+            cereal_distance = np.linalg.norm(pd.target-cereal_pos)
+            bread_distance = np.linalg.norm(pd.target-bread_pos)
+            can_distance = np.linalg.norm(pd.target-can_pos)
+
+            print([milk_distance, cereal_distance, bread_distance, can_distance])
+            if milk_distance<.2 and locked_state==None:
+                locked_state = "Milk"
+                print("LOCKED ONTO MILK")
+
+            elif cereal_distance<.2 and locked_state==None:
+                locked_state = "Cereal"
+                print("LOCKED ONTO CEREAL")
+            
+            elif bread_distance<.2 and locked_state==None:
+                locked_state = "Bread"
+                print("LOCKED ONTO BREAD")
+            
+            elif can_distance<.2 and locked_state==None:
+                locked_state = "Can"
+                print("LOCKED ONTO CAN")
+            
             # pd.target = [robot_pos[0]-0.1, robot_pos[1], robot_pos[2]]
             control = pd.update(robot_pos)
 
@@ -286,7 +337,7 @@ try:
                 rotvec = rot_error.as_rotvec()
                 
                 #map to robot orientation 
-                action[3:6] = 0.8 * rotvec
+                # action[3:6] = 0.8 * rotvec
       
             
         obs, reward, done, info = env.step(action)
