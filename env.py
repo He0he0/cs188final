@@ -219,7 +219,7 @@ print("Finger mode:", "Individual" if USE_INDIVIDUAL_FINGERS else "Unified")
 env = suite.make(
     env_name="PickPlace",
     robots="Panda",
-    gripper_types="InspireRightHand",
+    gripper_types="PandaGripper",
     has_renderer=True,
     has_offscreen_renderer=False,
     use_camera_obs=False,
@@ -238,6 +238,8 @@ try:
     locked_state = None
     pickup_state = None
     pickup_hold = 0
+    lock_timeout = 50
+    lock_timer = 300
     holding = False
     while not stop_event.is_set():
         with data_lock:
@@ -249,9 +251,17 @@ try:
             _ring_open   = ring_open** 0.7
             _pinky_open  = pinky_open** 0.7
         robot_pos = obs["robot0_eef_pos"]
-        action = np.zeros(12)
+        action = np.zeros(7)
         if hand_pos is not None:
             detected_hands+=1
+            lock_timeout-=1
+        if locked_state:
+            if lock_timer<0:
+                locked_state = None
+                pickup_state = None
+                pickup_hold = 0
+                lock_timer = 300
+            lock_timer-=1
         if hand_pos is not None and detected_hands>50:
 
             # x range is about -0.5 to 0.5
@@ -262,58 +272,57 @@ try:
             milk_pos = obs['Milk_pos'].copy()
             # milk_pos[0]+=0.01
             if not pickup_state:
-                milk_pos[2] += 0.3
+                milk_pos[2] += 0.12
             else:
-                milk_pos[2] += 0.1
+                milk_pos[2] += 0.05
 
             cereal_pos = obs["Cereal_pos"].copy()
             # cereal_pos[0]+=0.01
             if not pickup_state:
-                cereal_pos[2] += 0.3
+                cereal_pos[2] += 0.15
             else:
-                cereal_pos[2] += 0.1
+                cereal_pos[2] += 0.05
 
             bread_pos = obs["Bread_pos"].copy()
             # bread_pos[0]+=0.01
             if not pickup_state:
-                bread_pos[2] += 0.3
-            else:
-                bread_pos[2] += 0.1
+                bread_pos[2] += 0.06
 
             can_pos = obs["Can_pos"].copy()
             # can_pos[0]+=0.01
             if not pickup_state:
-                can_pos[2] += 0.3
+                can_pos[2] += 0.08
             else:
-                can_pos[2] += 0.1
+                can_pos[2] += 0.02
 
             milk_distance = np.linalg.norm(robot_pos-milk_pos)
             cereal_distance = np.linalg.norm(robot_pos-cereal_pos)
             bread_distance = np.linalg.norm(robot_pos-bread_pos)
             can_distance = np.linalg.norm(robot_pos-can_pos)
 
+            print([milk_distance, cereal_distance, bread_distance, can_distance])
             if locked_state=="Milk":
                 print(milk_distance)
                 pd.target = milk_pos
-                if pickup_state==1 and milk_distance<0.07:
+                if pickup_state==1 and milk_distance<0.02:
                     pickup_state = 2
             
             elif locked_state=="Cereal":
                 print(cereal_distance)
                 pd.target = cereal_pos
-                if pickup_state==1 and cereal_distance<0.07:
+                if pickup_state==1 and cereal_distance<0.02:
                     pickup_state = 2
             
             elif locked_state=="Bread":
                 pd.target = bread_pos
                 print(bread_distance)
-                if pickup_state==1 and bread_distance<0.07:
+                if pickup_state==1 and bread_distance<0.02:
                     pickup_state = 2
 
             elif locked_state=="Can":
                 pd.target = can_pos
                 print(can_distance)
-                if pickup_state==1 and can_distance<0.07:
+                if pickup_state==1 and can_distance<0.02:
                     pickup_state = 2
 
             else:
@@ -321,20 +330,23 @@ try:
             
 
             # print([milk_distance, cereal_distance, bread_distance, can_distance])
-            if not holding:
-                if milk_distance<.15 and locked_state==None:
+            print(holding)
+            print(locked_state)
+            print(lock_timeout)
+            if not holding and lock_timeout<0:
+                if milk_distance<.1 and locked_state==None:
                     locked_state = "Milk"
                     print("LOCKED ONTO MILK")
 
-                elif cereal_distance<.15 and locked_state==None:
+                elif cereal_distance<.1 and locked_state==None:
                     locked_state = "Cereal"
                     print("LOCKED ONTO CEREAL")
                 
-                elif bread_distance<.15 and locked_state==None:
+                elif bread_distance<.1 and locked_state==None:
                     locked_state = "Bread"
                     print("LOCKED ONTO BREAD")
                 
-                elif can_distance<.15 and locked_state==None:
+                elif can_distance<.1 and locked_state==None:
                     locked_state = "Can"
                     print("LOCKED ONTO CAN")
             
@@ -360,13 +372,18 @@ try:
                 action[10] = open_hand[4] + _thumb_open   * (close_hand[4] - open_hand[4])
             else:   
                 #map to all fingers at once
+                # print(hand_open)
                 if locked_state and not pickup_state and hand_open>0.5:
                     pickup_state = 1
-                    action[6:] = open_hand
+                    action[6] = -1.0
                 elif locked_state and not pickup_state==2:
-                    action[6:] = open_hand
+                    action[6] = -1.0
                 elif not locked_state or (locked_state and pickup_state==2):
-                    action[6:] = open_hand + hand_open * (close_hand - open_hand) * 0.5
+                    if hand_open<0.5:
+                        if holding:
+                            lock_timeout = 50
+                        holding = False
+                    action[6] = hand_open*2-1
             if wrist_frame is not None:
                 #wrist orientation
                 robot_world_mat = MP_TO_ROBOT @ wrist_frame
