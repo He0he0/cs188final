@@ -1,0 +1,8 @@
+robosuite
+mediapipe
+opencv-python
+# Install via: pip install git+https://github.com/ARISE-Initiative/anyteleop.git
+# anyteleop
+dex-retargeting
+numpy
+scipy
