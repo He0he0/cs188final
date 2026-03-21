@@ -27,7 +27,7 @@ const ProjectPage: React.FC = () => {
         
         <section style={gridSectionStyle}>
           <div style={infoCardStyle}>
-            <h4 style={{marginTop: 0}}>Vision-Based Mapping: </h4>
+            <h4 style={{marginTop: 0, fontWeight: 'bold', fontSize: 18}}>Vision-Based Mapping </h4>
             <p>The teleoperation of robots in simulated and real environments often requires the use of
             specialized equipment and controllers. When collecting data from demonstrations or testing
             robots, operators must typically have prior expertise or training to operate them. Vision-based
@@ -35,7 +35,7 @@ const ProjectPage: React.FC = () => {
             We do this by translating 2D camera coordinates to 3D robot workspace using dynamic scaling and joint-based depth estimation.</p>
           </div>
           <div style={infoCardStyle}>
-            <h4 style={{marginTop: 0}}>Shared Autonomy</h4>
+            <h4 style={{marginTop: 0, fontWeight: 'bold', fontSize: 18}}>Shared Autonomy</h4>
             <p>While intuitive, pure vision-based mapping can lack the precision required for many tasks,
 so we extend this system with simple shared autonomy, in which the human user maintains
 high-level motion control while the robot autonomously fine-tunes. This is accomplished through a biasing protocol that activates within a 0.15m radius of target objects, allowing for fine-tuned precision during the "grab" phase.</p>
